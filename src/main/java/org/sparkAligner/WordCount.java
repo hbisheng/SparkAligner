@@ -7,13 +7,18 @@ import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.api.java.function.Function2;
 import org.apache.spark.api.java.function.PairFunction;
+
+import scala.Function10;
+import scala.Tuple10;
 import scala.Tuple2;
  
+
+
 import java.util.Arrays;
 
 public class WordCount {
   private static final FlatMapFunction<String, String> WORDS_EXTRACTOR =
-      new FlatMapFunction<String, String>() {
+		  new FlatMapFunction<String, String>() {
         @Override
         public Iterable<String> call(String s) throws Exception {
           return Arrays.asList(s.split(" "));
@@ -44,12 +49,13 @@ public class WordCount {
 
     SparkConf conf = new SparkConf().setAppName("org.sparkexample.WordCount").setMaster("local");
     JavaSparkContext context = new JavaSparkContext(conf);
-
+    
     JavaRDD<String> file = context.textFile(args[0]);
     JavaRDD<String> words = file.flatMap(WORDS_EXTRACTOR);
     JavaPairRDD<String, Integer> pairs = words.mapToPair(WORDS_MAPPER);
     JavaPairRDD<String, Integer> counter = pairs.reduceByKey(WORDS_REDUCER);
 
     counter.saveAsTextFile(args[1]);
+    context.stop();
   }
 }
