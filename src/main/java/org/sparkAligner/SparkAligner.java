@@ -36,6 +36,15 @@ public class SparkAligner {
             byte [] b1 = bw1.getBytes();
             byte [] b2 = bw2.getBytes();
             
+            if(b1.length == 0 & b2.length != 0) {
+                return 1;
+            }
+            if(b1.length == 0 & b2.length == 0) {
+                return 0;
+            }
+            if(b1.length != 0 & b2.length == 0) {
+                return -1;
+            }
             // just compare the first byte
             boolean firstIsQry  = (b1[0]&0x01) == 0;
             boolean secondIsQry = (b2[0]&0x01) == 0;
@@ -114,8 +123,8 @@ public class SparkAligner {
         String refPath = dataHostURL + args[0];
         String qryPath = dataHostURL + args[1];
         String outputPath = dataHostURL + args[2];
-        int refPartition = 2;
-        int qryPartition = 2;
+        int refPartition = 6;
+        int qryPartition = 6;
         
         final int MIN_READ_LEN = 36;
         final int MAX_READ_LEN = 36;
@@ -129,7 +138,7 @@ public class SparkAligner {
         final int BLOCK_SIZE = 128;
         final int REDUNDANCY = 16;
         
-        SparkConf conf = new SparkConf().setAppName("org.sparkexample.WordCount").setMaster("local");    
+        SparkConf conf = new SparkConf().setAppName("org.sparkexample.WordCount").setMaster("local[12]");    
         conf.registerKryoClasses(
             new Class<?>[] {
                 Class.forName("org.apache.hadoop.io.IntWritable"),
@@ -322,7 +331,7 @@ public class SparkAligner {
                         while(iter.hasNext()) {
                             res.add( copyByteFromBytesWritable((iter.next())) );
                         }
-                        Collections.sort(res, new SeedInfoComparator());
+                        //Collections.sort(res, new SeedInfoComparator());
                         return res;
                     }
                 });
@@ -352,14 +361,18 @@ public class SparkAligner {
                         int qbatch = 0;
                         // Reference mers are first, save them away
                         while (iterForSeedInfo.hasNext()) {
-                            MerRecord merIn = new MerRecord(copyByteFromBytesWritable(iterForSeedInfo.next())); 
+                            BytesWritable btmp = iterForSeedInfo.next();
+                            if(btmp.getLength() == 0) continue;
+
+                            MerRecord merIn = new MerRecord(copyByteFromBytesWritable(btmp)); 
                             if (merIn.isReference) {
                                 // just save away the reference tuples
                                 totalr++;
                                 reftuples.add(merIn);
                                 if (totalq != 0) {
                                     //String ss = DNAString.bytesToString(DNAString.seedToArr(mer.get(), SEED_LEN, REDUNDANCY));
-                                    throw new IOException("ERROR: Saw a reference seed after a query seed");
+                                    return new ArrayList<Tuple2<IntWritable, BytesWritable>>();
+                                    //throw new IOException("ERROR: Saw a reference seed after a query seed");
                                 }
                             }   
                             else {
@@ -518,7 +531,9 @@ public class SparkAligner {
                             return fullalignment;
                         }
                         catch (Exception e) {
-                            throw new IOException("Problem with read:" + qrytuple.id + " :" + e.getMessage() + "\n");   
+                            //throw new IOException("Problem with read:" + qrytuple.id + " :" + e.getMessage() + "\n");   
+                            //System.out.println("Problem with read:" + qrytuple.id + ":" + e.toString());
+                            return new AlignmentRecord(-1, -1, -1, -1, true);
                         }
                     }
                 }); 
