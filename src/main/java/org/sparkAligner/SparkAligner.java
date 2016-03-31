@@ -24,87 +24,8 @@ import java.util.Iterator;
 import java.util.List;
 
 public class SparkAligner {
-    
-    static class SeedInfoComparator implements Comparator<BytesWritable>, Serializable {
-        @Override
-        public int compare(BytesWritable o1, BytesWritable o2) {
-            // reference seeds should be seen before query seeds 
-            
-            BytesWritable bw1 = SparkAligner.copyByteFromBytesWritable( (BytesWritable) o1);
-            BytesWritable bw2 = SparkAligner.copyByteFromBytesWritable( (BytesWritable) o2);
-            
-            byte [] b1 = bw1.getBytes();
-            byte [] b2 = bw2.getBytes();
-            
-            if(b1.length == 0 & b2.length != 0) {
-                return 1;
-            }
-            if(b1.length == 0 & b2.length == 0) {
-                return 0;
-            }
-            if(b1.length != 0 & b2.length == 0) {
-                return -1;
-            }
-            // just compare the first byte
-            boolean firstIsQry  = (b1[0]&0x01) == 0;
-            boolean secondIsQry = (b2[0]&0x01) == 0;
-            
-            return Boolean.compare(firstIsQry, secondIsQry);
-        }
-    }
-    
-    static class SeedPartitioner extends Partitioner {
-        private int numPart = 0; 
-        public SeedPartitioner(int num) {
-            numPart = num;
-        }
         
-        @Override
-        public int getPartition(Object arg0) {
-            BytesWritable key = SparkAligner.copyByteFromBytesWritable( (BytesWritable) arg0 );
-            int part = (WritableComparator.hashBytes(key.getBytes(), key.getLength()-1) & Integer.MAX_VALUE) % numPart;
-            return part;
-        }
     
-        @Override
-        public int numPartitions() {
-            return numPart;
-        }
-    };
-    
-    static class SeedComparator implements Comparator<BytesWritable>, Serializable {
-        @Override
-        public int compare(BytesWritable o1, BytesWritable o2) {
-            
-            BytesWritable bw1 = SparkAligner.copyByteFromBytesWritable( (BytesWritable) o1);
-            BytesWritable bw2 = SparkAligner.copyByteFromBytesWritable( (BytesWritable) o2);
-            
-            byte [] b1 = bw1.getBytes();
-            byte [] b2 = bw2.getBytes();
-            
-            // skip the last byte which has the ref/qry flag
-            int len = bw1.getLength()-1;
-            for (int i = 0; i < len; i++)
-            {
-                int diff = b1[i] - b2[i];
-                if (diff != 0) { 
-                    return diff; 
-                }
-            }
-            return 0;
-        }
-    }
-    
-    static PairFunction<Tuple2<IntWritable, BytesWritable>, IntWritable, BytesWritable> mapToClone 
-        = new PairFunction<Tuple2<IntWritable,BytesWritable>, IntWritable, BytesWritable>() {
-            @Override
-            public Tuple2<IntWritable, BytesWritable> call(Tuple2<IntWritable, BytesWritable> arg0)
-                    throws Exception {
-                byte[] bytesCopied = new byte[arg0._2.getLength()];
-                System.arraycopy(arg0._2.getBytes(), 0, bytesCopied, 0, bytesCopied.length);
-                return new Tuple2<IntWritable, BytesWritable>(new IntWritable(arg0._1.get()), new BytesWritable(bytesCopied));
-            }
-        };
         
     protected static BytesWritable copyByteFromBytesWritable(BytesWritable next) {          
         byte[] bytesCopied = new byte[next.getLength()];
@@ -138,7 +59,7 @@ public class SparkAligner {
         final int BLOCK_SIZE = 128;
         final int REDUNDANCY = 16;
         
-        SparkConf conf = new SparkConf().setAppName("org.sparkexample.WordCount").setMaster("local[12]");    
+        SparkConf conf = new SparkConf().setAppName("org.sparkexample.WordCount").setMaster("local[16]");    
         conf.registerKryoClasses(
             new Class<?>[] {
                 Class.forName("org.apache.hadoop.io.IntWritable"),
@@ -152,6 +73,17 @@ public class SparkAligner {
         
         JavaPairRDD<IntWritable, BytesWritable> refRawSequence = context.sequenceFile(refPath, IntWritable.class, BytesWritable.class, refPartition);
         JavaPairRDD<IntWritable, BytesWritable> qryRawSequence = context.sequenceFile(qryPath, IntWritable.class, BytesWritable.class, qryPartition);
+        
+        PairFunction<Tuple2<IntWritable, BytesWritable>, IntWritable, BytesWritable> mapToClone 
+        = new PairFunction<Tuple2<IntWritable,BytesWritable>, IntWritable, BytesWritable>() {
+            @Override
+            public Tuple2<IntWritable, BytesWritable> call(Tuple2<IntWritable, BytesWritable> arg0)
+                    throws Exception {
+                byte[] bytesCopied = new byte[arg0._2.getLength()];
+                System.arraycopy(arg0._2.getBytes(), 0, bytesCopied, 0, bytesCopied.length);
+                return new Tuple2<IntWritable, BytesWritable>(new IntWritable(arg0._1.get()), new BytesWritable(bytesCopied));
+            }
+        };
         
         JavaPairRDD<IntWritable, BytesWritable> clonedRefSequence = refRawSequence.mapToPair(mapToClone);
         JavaPairRDD<IntWritable, BytesWritable> clonedQrySequence = qryRawSequence.mapToPair(mapToClone);
@@ -175,7 +107,9 @@ public class SparkAligner {
                         BytesWritable rawRecord = copyByteFromBytesWritable(seqTuple._2);
                         
                         MerRecord seedInfo = new MerRecord();
-                        byte [] seedbuffer   = new byte[DNAString.arrToSeedLen(SEED_LEN, REDUNDANCY)];
+                        DNAString dnaString = new DNAString();
+                        
+                        byte [] seedbuffer   = new byte[dnaString.arrToSeedLen(SEED_LEN, REDUNDANCY)];
                         
                         FastaRecord record = new FastaRecord();
                         record.fromBytes(rawRecord);
@@ -202,7 +136,7 @@ public class SparkAligner {
                         }
                         for (int start = startoffset, realoffset = realoffsetstart; start < end; start++, realoffset++) {
                             // emit the mers starting at every position in the range
-                            if (DNAString.arrHasN(seq, start, SEED_LEN)) { continue; } // don't bother with seeds with n's
+                            if (dnaString.arrHasN(seq, start, SEED_LEN)) { continue; } // don't bother with seeds with n's
                             
                             seedInfo.offset = realoffset;
                             // figure out the ranges for the flanking sequence
@@ -216,15 +150,15 @@ public class SparkAligner {
                             int rightlen = rightend-rightstart;
                             
                             BytesWritable seedbinary = seedInfo.toBytes(seq, leftstart, leftlen, rightstart, rightlen);
-                            if ((REDUNDANCY > 1) && (DNAString.repseed(seq, start, SEED_LEN))) {
+                            if ((REDUNDANCY > 1) && (dnaString.repseed(seq, start, SEED_LEN))) {
                                 for (int r = 0; r < REDUNDANCY; r++) {
-                                    DNAString.arrToSeed(seq, start, SEED_LEN, seedbuffer, 0, r, REDUNDANCY, 0);
+                                    dnaString.arrToSeed(seq, start, SEED_LEN, seedbuffer, 0, r, REDUNDANCY, 0);
                                     seed.set(seedbuffer, 0, seedbuffer.length);
                                     res.add(new Tuple2<BytesWritable, BytesWritable>(copyByteFromBytesWritable(seed), copyByteFromBytesWritable(seedbinary)));
                                 }
                             }
                             else {
-                                DNAString.arrToSeed(seq, start, SEED_LEN, seedbuffer, 0, 0, REDUNDANCY, 0);
+                                dnaString.arrToSeed(seq, start, SEED_LEN, seedbuffer, 0, 0, REDUNDANCY, 0);
                                 seed.set(seedbuffer, 0, seedbuffer.length);
                                 res.add(new Tuple2<BytesWritable, BytesWritable>(copyByteFromBytesWritable(seed), copyByteFromBytesWritable(seedbinary)));
                             }
@@ -232,7 +166,6 @@ public class SparkAligner {
                         return res;
                     }
                 });
-    
         
         JavaPairRDD<BytesWritable, BytesWritable> mappedQrySeeds = clonedQrySequence
             .flatMapToPair(
@@ -254,6 +187,8 @@ public class SparkAligner {
                         
                         FastaRecord record = new FastaRecord();
                         record.fromBytes(rawRecord);
+                        
+                        DNAString dnaString = new DNAString();
                         
                         byte [] seq         = record.m_sequence;
                         int seqlen = seq.length;
@@ -279,19 +214,19 @@ public class SparkAligner {
                             
                             // reverse complement the sequence
                             if (rc == 1) {
-                                DNAString.rcarr_inplace(seq);
+                                dnaString.rcarr_inplace(seq);
                                 seedInfo.isRC = true;
                             }
 
                             // only emit the non-overlapping mers
                             for (int i = 0; i + SEED_LEN <= seqlen; i += SEED_LEN) {
-                                if (DNAString.arrHasN(seq, i, SEED_LEN)) { continue; }
+                                if (dnaString.arrHasN(seq, i, SEED_LEN)) { continue; }
                                 
-                                byte [] seedbuffer   = new byte[DNAString.arrToSeedLen(SEED_LEN, REDUNDANCY)];
-                                if ((REDUNDANCY > 1) && (DNAString.repseed(seq, i, SEED_LEN))) {
-                                    DNAString.arrToSeed(seq, i, SEED_LEN, seedbuffer, 0, seedInfo.id, REDUNDANCY, 0);   
+                                byte [] seedbuffer   = new byte[dnaString.arrToSeedLen(SEED_LEN, REDUNDANCY)];
+                                if ((REDUNDANCY > 1) && (dnaString.repseed(seq, i, SEED_LEN))) {
+                                    dnaString.arrToSeed(seq, i, SEED_LEN, seedbuffer, 0, seedInfo.id, REDUNDANCY, 0);   
                                 } else {
-                                    DNAString.arrToSeed(seq, i, SEED_LEN, seedbuffer, 0, 0, REDUNDANCY, 0);
+                                    dnaString.arrToSeed(seq, i, SEED_LEN, seedbuffer, 0, 0, REDUNDANCY, 0);
                                 }
                                 
                                 BytesWritable seedBinary = new BytesWritable();
@@ -329,12 +264,27 @@ public class SparkAligner {
                         List<BytesWritable> res = new ArrayList<BytesWritable>();
                         Iterator<BytesWritable> iter = arg0.iterator();
                         while(iter.hasNext()) {
-                            res.add( copyByteFromBytesWritable((iter.next())) );
+                            
+                            BytesWritable btmp = iter.next();
+                            MerRecord merIn = new MerRecord(copyByteFromBytesWritable(btmp));
+                            /*
+                            System.out.println(
+                                    "In groupping: " + 
+                                    merIn.id + " " 
+                                    + merIn.offset + " " 
+                                    + merIn.isReference + " " 
+                                    + merIn.isRC + " bytes:" + btmp);
+                            System.out.println(merIn.id + "toString(): " + merIn.toString());
+                            */  
+                            res.add( copyByteFromBytesWritable(btmp));
                         }
-                        //Collections.sort(res, new SeedInfoComparator());
+                        
+                        Collections.sort(res, new SeedInfoComparator());
                         return res;
                     }
-                });
+                }).cache();
+        
+        
         
         JavaPairRDD<IntWritable, BytesWritable> alignments = 
             groupedSeeds.flatMapToPair(
@@ -362,24 +312,35 @@ public class SparkAligner {
                         // Reference mers are first, save them away
                         while (iterForSeedInfo.hasNext()) {
                             BytesWritable btmp = iterForSeedInfo.next();
-                            if(btmp.getLength() == 0) continue;
-
-                            MerRecord merIn = new MerRecord(copyByteFromBytesWritable(btmp)); 
+                            //if(btmp.getLength() == 0) continue;
+                            
+                            MerRecord merIn = new MerRecord(copyByteFromBytesWritable(btmp));
+                            
+                            /*
+                            System.out.println(
+                                    "In alignment: " +
+                                    merIn.id + " " 
+                                    + merIn.offset + " " 
+                                    + merIn.isReference + " " 
+                                    + merIn.isRC + " bytes:" + btmp);
+                            System.out.println(merIn.id + "toString(): " + merIn.toString());
+                            */
                             if (merIn.isReference) {
                                 // just save away the reference tuples
                                 totalr++;
                                 reftuples.add(merIn);
                                 if (totalq != 0) {
                                     //String ss = DNAString.bytesToString(DNAString.seedToArr(mer.get(), SEED_LEN, REDUNDANCY));
-                                    return new ArrayList<Tuple2<IntWritable, BytesWritable>>();
-                                    //throw new IOException("ERROR: Saw a reference seed after a query seed");
+                                    //return new ArrayList<Tuple2<IntWritable, BytesWritable>>();
+                                    throw new IOException("ERROR: Saw a reference seed after a query seed");
                                 }
                             }   
                             else {
                                 if (totalr == 0) {
                                     // got a qry tuple, but there were no reference tuples
-                                    // System.err.println(" Saw a query tuple, but no referernce tuple!!!");
-                                    return new ArrayList<Tuple2<IntWritable, BytesWritable>>();
+                                    // This is reasonable when the read cannot be mapped onto any reference kmers
+                                    
+                                    //System.err.println(" Saw a query tuple, but no referernce tuple!!!");
                                 }
         
                                 qrytuples.add(merIn);
@@ -492,12 +453,13 @@ public class SparkAligner {
                         int refEnd      = reftuple.offset + SEED_LEN;
                         int differences = 0;
                         LandauVishkin landauVishkinObj = new LandauVishkin();
+                        DNAString dnaString = new DNAString();
                         landauVishkinObj.configure(K);
                         
                         try {               
                             if (qrytuple.leftFlank.length != 0) {
                                 // at least 1 read base on the left needs to be aligned
-                                int realleftflanklen = DNAString.dnaArrLen(qrytuple.leftFlank);
+                                int realleftflanklen = dnaString.dnaArrLen(qrytuple.leftFlank);
                                 
                                 // aligned the pre-reversed strings!
                                 AlignInfo a = landauVishkinObj.extend(
@@ -531,9 +493,11 @@ public class SparkAligner {
                             return fullalignment;
                         }
                         catch (Exception e) {
-                            //throw new IOException("Problem with read:" + qrytuple.id + " :" + e.getMessage() + "\n");   
+                            
+                            String err_msg = "###" + e.getStackTrace()[0];
+                            throw new IOException("Problem with read:" + qrytuple.id + " \n" + qrytuple.toString() +"\n" + e.toString() + " " + err_msg +"\n");   
                             //System.out.println("Problem with read:" + qrytuple.id + ":" + e.toString());
-                            return new AlignmentRecord(-1, -1, -1, -1, true);
+                            //return new AlignmentRecord(-1, -1, -1, -1, true);
                         }
                     }
                 }); 
@@ -544,8 +508,9 @@ public class SparkAligner {
                 BytesWritable.class, 
                 SequenceFileOutputFormat.class);
         
+        
         timeMid = System.currentTimeMillis();
-        System.out.println("Alignment time: " + (timeMid-timeStart)/1000.0 + " seconds");
+        System.out.println("Alignment time: " + (timeMid-timeStart)/1000.0 + " seconds.");
         
         //********************************************RESULTS FILTERING************************************************************
         JavaPairRDD<IntWritable, BytesWritable> clonedAlignments 
@@ -660,8 +625,70 @@ public class SparkAligner {
                 SequenceFileOutputFormat.class);
         long timeEnd = System.currentTimeMillis();
         System.out.println("Filter time: " + (timeEnd - timeMid)/1000.0 + " seconds");
-        System.out.println("Filter time: " + (timeEnd - timeStart)/1000.0 + " seconds");
+        System.out.println("Total time: " + (timeEnd - timeStart)/1000.0 + " seconds");
         System.out.println("Output alignments number: " + unambiguousAlign.count());
         context.stop();
+    }
+}
+
+class SeedInfoComparator implements Comparator<BytesWritable>, Serializable {
+    @Override
+    public int compare(BytesWritable o1, BytesWritable o2) {
+        // reference seeds should be seen before query seeds 
+        
+        BytesWritable bw1 = SparkAligner.copyByteFromBytesWritable( (BytesWritable) o1);
+        BytesWritable bw2 = SparkAligner.copyByteFromBytesWritable( (BytesWritable) o2);
+        
+        byte [] b1 = bw1.getBytes();
+        byte [] b2 = bw2.getBytes();
+        
+        // just compare the first byte
+        boolean firstIsQry  = (b1[0]&0x01) == 0;
+        boolean secondIsQry = (b2[0]&0x01) == 0;
+        
+        return Boolean.compare(firstIsQry, secondIsQry);
+    }
+}
+
+
+class SeedPartitioner extends Partitioner {
+    private int numPart = 0; 
+    public SeedPartitioner(int num) {
+        numPart = num;
+    }
+    
+    @Override
+    public int getPartition(Object arg0) {
+        BytesWritable key = SparkAligner.copyByteFromBytesWritable( (BytesWritable) arg0 );
+        int part = (WritableComparator.hashBytes(key.getBytes(), key.getLength()-1) & Integer.MAX_VALUE) % numPart;
+        return part;
+    }
+
+    @Override
+    public int numPartitions() {
+        return numPart;
+    }
+};
+
+class SeedComparator implements Comparator<BytesWritable>, Serializable {
+    @Override
+    public int compare(BytesWritable o1, BytesWritable o2) {
+        
+        BytesWritable bw1 = SparkAligner.copyByteFromBytesWritable( (BytesWritable) o1);
+        BytesWritable bw2 = SparkAligner.copyByteFromBytesWritable( (BytesWritable) o2);
+        
+        byte [] b1 = bw1.getBytes();
+        byte [] b2 = bw2.getBytes();
+        
+        // skip the last byte which has the ref/qry flag
+        int len = bw1.getLength()-1;
+        for (int i = 0; i < len; i++)
+        {
+            int diff = b1[i] - b2[i];
+            if (diff != 0) { 
+                return diff; 
+            }
+        }
+        return 0;
     }
 }
