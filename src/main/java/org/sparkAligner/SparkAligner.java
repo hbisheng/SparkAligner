@@ -12,20 +12,19 @@ import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.Function2;
 import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.api.java.function.PairFunction;
+import org.apache.spark.broadcast.Broadcast;
+
 import scala.Serializable;
 import scala.Tuple2;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 
 public class SparkAligner {
-        
-    
         
     protected static BytesWritable copyByteFromBytesWritable(BytesWritable next) {          
         byte[] bytesCopied = new byte[next.getLength()];
@@ -44,22 +43,21 @@ public class SparkAligner {
         String refPath = dataHostURL + args[0];
         String qryPath = dataHostURL + args[1];
         String outputPath = dataHostURL + args[2];
-        int refPartition = 6;
-        int qryPartition = 6;
+        int refPartition = 360;
+        int qryPartition = 360;
         
         final int MIN_READ_LEN = 36;
         final int MAX_READ_LEN = 36;
         final int K = 3;
         final boolean ALLOW_DIFFERENCES = false;
         final boolean FILTER_ALIGNMENTS = true;
-        final int MAPPER_NUM = 240;
-        final int REDUCER_NUM = 48;
-        final int FILTER_MAPPER_NUM = 24;
-        final int FILTER_REDUCER_NUM = 24;
         final int BLOCK_SIZE = 128;
         final int REDUNDANCY = 16;
+        final int SEED_LEN   = MIN_READ_LEN / (K+1);
         
-        SparkConf conf = new SparkConf().setAppName("org.sparkexample.WordCount").setMaster("local[16]");    
+        SparkConf conf = new SparkConf().setAppName("org.sparkexample.WordCount")
+                .setMaster("local[16]");   
+        
         conf.registerKryoClasses(
             new Class<?>[] {
                 Class.forName("org.apache.hadoop.io.IntWritable"),
@@ -88,6 +86,14 @@ public class SparkAligner {
         JavaPairRDD<IntWritable, BytesWritable> clonedRefSequence = refRawSequence.mapToPair(mapToClone);
         JavaPairRDD<IntWritable, BytesWritable> clonedQrySequence = qryRawSequence.mapToPair(mapToClone);
         
+        
+        DNAString tmpDnaString = new DNAString();
+        LandauVishkin tmpLandauVishkinObj = new LandauVishkin();
+        tmpLandauVishkinObj.configure(K);
+        
+        final Broadcast<DNAString> broadcastDNAString = context.broadcast(tmpDnaString);
+        final Broadcast<LandauVishkin> broadcastLandauVishkin = context.broadcast(tmpLandauVishkinObj);
+        
         JavaPairRDD<BytesWritable, BytesWritable> mappedRefSeeds = clonedRefSequence
             .flatMapToPair(
                 /**
@@ -107,7 +113,8 @@ public class SparkAligner {
                         BytesWritable rawRecord = copyByteFromBytesWritable(seqTuple._2);
                         
                         MerRecord seedInfo = new MerRecord();
-                        DNAString dnaString = new DNAString();
+                        
+                        DNAString dnaString = broadcastDNAString.value();
                         
                         byte [] seedbuffer   = new byte[dnaString.arrToSeedLen(SEED_LEN, REDUNDANCY)];
                         
@@ -165,7 +172,8 @@ public class SparkAligner {
                         }
                         return res;
                     }
-                });
+                }).partitionBy(new SeedPartitioner(refPartition));
+        
         
         JavaPairRDD<BytesWritable, BytesWritable> mappedQrySeeds = clonedQrySequence
             .flatMapToPair(
@@ -188,7 +196,7 @@ public class SparkAligner {
                         FastaRecord record = new FastaRecord();
                         record.fromBytes(rawRecord);
                         
-                        DNAString dnaString = new DNAString();
+                        DNAString dnaString = broadcastDNAString.value();
                         
                         byte [] seq         = record.m_sequence;
                         int seqlen = seq.length;
@@ -246,261 +254,77 @@ public class SparkAligner {
                         }
                         return res;
                     }
-                });
+                }).partitionBy(new SeedPartitioner(qryPartition));
         
-        JavaPairRDD<BytesWritable, BytesWritable> combinedMappedSeeds = mappedQrySeeds.union(mappedRefSeeds);
-        
-        JavaPairRDD<BytesWritable, Iterable<BytesWritable>> groupedSeeds = 
-            combinedMappedSeeds.groupByKey().mapValues(
-                /**
-                 * Sort the seeds to let references seeds come before query seeds
-                 */
-                new Function<Iterable<BytesWritable>, Iterable<BytesWritable>>() {
-                    @Override
-                    public Iterable<BytesWritable> call(Iterable<BytesWritable> arg0)
-                            throws Exception {
+        JavaPairRDD<IntWritable, BytesWritable> alignments = mappedQrySeeds.join(mappedRefSeeds).flatMapToPair(new PairFlatMapFunction<Tuple2<BytesWritable,Tuple2<BytesWritable,BytesWritable>>, IntWritable, BytesWritable>() {
+            @Override
+            public Iterable<Tuple2<IntWritable, BytesWritable>> call(
+                    Tuple2<BytesWritable, Tuple2<BytesWritable, BytesWritable>> arg0)
+                    throws Exception {
+                
+                List<Tuple2<IntWritable, BytesWritable>> res = new ArrayList<Tuple2<IntWritable, BytesWritable>>(); 
+                
+                BytesWritable qryByw = copyByteFromBytesWritable(arg0._2._1);
+                BytesWritable refByw = copyByteFromBytesWritable(arg0._2._2);
+                MerRecord reftuple = new MerRecord(refByw);
+                MerRecord qrytuple = new MerRecord(qryByw);
+                
+                int refStart    = reftuple.offset;
+                int refEnd      = reftuple.offset + SEED_LEN;
+                int differences = 0;
+                
+                
+                LandauVishkin landauVishkinObj = broadcastLandauVishkin.value();
+                DNAString dnaString = broadcastDNAString.value();
+                
+                try {               
+                    if (qrytuple.leftFlank.length != 0) {
+                        // at least 1 read base on the left needs to be aligned
+                        int realleftflanklen = dnaString.dnaArrLen(qrytuple.leftFlank);
                         
-                        // sort the record by value
-                        List<BytesWritable> res = new ArrayList<BytesWritable>();
-                        Iterator<BytesWritable> iter = arg0.iterator();
-                        while(iter.hasNext()) {
-                            
-                            BytesWritable btmp = iter.next();
-                            MerRecord merIn = new MerRecord(copyByteFromBytesWritable(btmp));
-                            /*
-                            System.out.println(
-                                    "In groupping: " + 
-                                    merIn.id + " " 
-                                    + merIn.offset + " " 
-                                    + merIn.isReference + " " 
-                                    + merIn.isRC + " bytes:" + btmp);
-                            System.out.println(merIn.id + "toString(): " + merIn.toString());
-                            */  
-                            res.add( copyByteFromBytesWritable(btmp));
-                        }
+                        // aligned the pre-reversed strings!
+                        AlignInfo a = landauVishkinObj.extend(
+                                reftuple.leftFlank, 
+                                qrytuple.leftFlank, 
+                                K, ALLOW_DIFFERENCES);
                         
-                        Collections.sort(res, new SeedInfoComparator());
-                        return res;
-                    }
-                }).cache();
-        
-        
-        
-        JavaPairRDD<IntWritable, BytesWritable> alignments = 
-            groupedSeeds.flatMapToPair(
-                /**
-                 * For each seeds, gather their record and perform batch align  
-                 */
-                new PairFlatMapFunction<Tuple2<BytesWritable, Iterable<BytesWritable>>, IntWritable, BytesWritable>() {         
-                    
-                    int SEED_LEN   = MIN_READ_LEN / (K+1);
-                    
-                    @Override
-                    public Iterable<Tuple2<IntWritable, BytesWritable>> call(
-                            Tuple2<BytesWritable, Iterable<BytesWritable>> iterSeedTuple)
-                            throws Exception {
+                        if (a.alignlen == -1) { return res; } // alignment failed
+                        if (!a.isBazeaYatesSeed(realleftflanklen, SEED_LEN)) { return res; }
                         
-                        List<Tuple2<IntWritable, BytesWritable>> res = new ArrayList<Tuple2<IntWritable, BytesWritable>>();
-                        List<MerRecord> reftuples = new ArrayList<MerRecord>();
-                        List<MerRecord> qrytuples = new ArrayList<MerRecord>();
-                        
-                        Iterator<BytesWritable> iterForSeedInfo = iterSeedTuple._2.iterator();
-                        
-                        int totalr = 0;
-                        int totalq = 0;
-                        int qbatch = 0;
-                        // Reference mers are first, save them away
-                        while (iterForSeedInfo.hasNext()) {
-                            BytesWritable btmp = iterForSeedInfo.next();
-                            //if(btmp.getLength() == 0) continue;
-                            
-                            MerRecord merIn = new MerRecord(copyByteFromBytesWritable(btmp));
-                            
-                            /*
-                            System.out.println(
-                                    "In alignment: " +
-                                    merIn.id + " " 
-                                    + merIn.offset + " " 
-                                    + merIn.isReference + " " 
-                                    + merIn.isRC + " bytes:" + btmp);
-                            System.out.println(merIn.id + "toString(): " + merIn.toString());
-                            */
-                            if (merIn.isReference) {
-                                // just save away the reference tuples
-                                totalr++;
-                                reftuples.add(merIn);
-                                if (totalq != 0) {
-                                    //String ss = DNAString.bytesToString(DNAString.seedToArr(mer.get(), SEED_LEN, REDUNDANCY));
-                                    //return new ArrayList<Tuple2<IntWritable, BytesWritable>>();
-                                    throw new IOException("ERROR: Saw a reference seed after a query seed");
-                                }
-                            }   
-                            else {
-                                if (totalr == 0) {
-                                    // got a qry tuple, but there were no reference tuples
-                                    // This is reasonable when the read cannot be mapped onto any reference kmers
-                                    
-                                    //System.err.println(" Saw a query tuple, but no referernce tuple!!!");
-                                }
-        
-                                qrytuples.add(merIn);
-                                totalq++;
-                                qbatch++;
-                                
-                                if (qbatch == BLOCK_SIZE) {
-                                    alignBatch(res, reftuples, qrytuples);
-                                    qrytuples.clear();
-                                    qbatch = 0;
-                                }
-                            }
-                        }
-                        
-                        if (qbatch != 0){
-                            alignBatch(res, reftuples, qrytuples);
-                        }
-                        
-                        return res;
+                        refStart    -= a.alignlen;
+                        differences = a.differences;
                     }
                     
-                    public void alignBatch(List<Tuple2<IntWritable, BytesWritable>> res, List<MerRecord> reftuples, List<MerRecord> qrytuples) 
-                            throws IOException
-                    {
-                        AlignmentRecord [] bestalignments = null;
-                        AlignmentRecord [] secondalignments = null;
-                        boolean [] recordsecond;
-                        int [] bestk;
-                        
-                        if (FILTER_ALIGNMENTS) {
-                            bestalignments   = new AlignmentRecord[BLOCK_SIZE];
-                            secondalignments = new AlignmentRecord[BLOCK_SIZE];
-                            recordsecond     = new boolean[BLOCK_SIZE];
-                            bestk            = new int[BLOCK_SIZE];
-                            for (int i = 0; i < BLOCK_SIZE; i++)
-                            {
-                                bestalignments[i]   = new AlignmentRecord();
-                                secondalignments[i] = new AlignmentRecord();
-                            }
-                        }
-                        
-                        int numr = reftuples.size();
-                        int numq = qrytuples.size();
-                        
-                        // join together the query-ref shared mers
-                        if ((numr != 0) && (numq != 0)) {       
-                            // Align reads to the references in blocks of BLOCK_SIZE x BLOCK_SIZE to improve cache locality
-                            // define a qry block between [startq, lastq)
-                            
-                            for (int startq = 0; startq < numq; startq += BLOCK_SIZE) {
-                                int lastq = startq + BLOCK_SIZE;
-                                if (lastq > numq) { lastq = numq; }
-                                
-                                if (FILTER_ALIGNMENTS) {
-                                  java.util.Arrays.fill(bestk, K+1);
-                                }
-                                
-                                // define a ref block between [startr, lastr)
-                                for (int startr = 0; startr < numr; startr += BLOCK_SIZE) {
-                                    int lastr = startr + BLOCK_SIZE;
-                                    if (lastr > numr) { lastr = numr; }
-        
-                                    // for each element in [startq, lastq)
-                                    for (int curq = startq; curq < lastq; curq++) {
-                                        MerRecord qry = qrytuples.get(curq);
-                                        
-                                        // for each element in [startr, lastr)
-                                        for (int curr = startr; curr < lastr; curr++) {
-                                            AlignmentRecord rec = extend(qry, reftuples.get(curr));
-                                            
-                                            if (rec.m_differences == -1) continue;
-                                            if (FILTER_ALIGNMENTS) {
-                                                int qidx = curq - startq;
-                                                if (rec.m_differences < bestk[qidx]) { 
-                                                    bestk[qidx] = rec.m_differences;
-                                                    bestalignments[qidx].set(rec);
-                                                    recordsecond[qidx] = false;
-                                                } else if (rec.m_differences == bestk[qidx]) {  
-                                                    secondalignments[qidx].set(rec);
-                                                    recordsecond[qidx] = true;
-                                                }
-                                            } else {
-                                                res.add(new Tuple2<IntWritable, BytesWritable>(new IntWritable(qry.id), rec.toBytes()));
-                                            }
-                                        }
-                                    }
-                                }
-                                
-                                if (FILTER_ALIGNMENTS) {
-                                    for (int qidx = 0; qidx < lastq - startq; qidx++) {
-                                        if (bestk[qidx] <= K) {
-                                            res.add(new Tuple2<IntWritable, BytesWritable>(new IntWritable(qrytuples.get(qidx+startq).id), bestalignments[qidx].toBytes()));
-                                            if (recordsecond[qidx]) {
-                                                res.add(new Tuple2<IntWritable, BytesWritable>(new IntWritable(qrytuples.get(qidx+startq).id), secondalignments[qidx].toBytes()));
-                                            }
-                                        }
-                                    }
-                                }
-                                
-                            }
-                        }
-        
+                    if (qrytuple.rightFlank.length != 0) {
+                        AlignInfo b = landauVishkinObj.extend(reftuple.rightFlank, 
+                                                                       qrytuple.rightFlank, 
+                                                                       K - differences, 
+                                                                       ALLOW_DIFFERENCES);
+                        if (b.alignlen == -1) { return res;   } // alignment failed
+                        refEnd      += b.alignlen;
+                        differences += b.differences;
                     }
                     
-                    //------------------------- extend --------------------------
-                    // Given an exact shared seed, try to extend to a full length alignment
-                    public AlignmentRecord extend(MerRecord qrytuple, MerRecord reftuple) throws IOException 
-                    {
-                        int refStart    = reftuple.offset;
-                        int refEnd      = reftuple.offset + SEED_LEN;
-                        int differences = 0;
-                        LandauVishkin landauVishkinObj = new LandauVishkin();
-                        DNAString dnaString = new DNAString();
-                        landauVishkinObj.configure(K);
-                        
-                        try {               
-                            if (qrytuple.leftFlank.length != 0) {
-                                // at least 1 read base on the left needs to be aligned
-                                int realleftflanklen = dnaString.dnaArrLen(qrytuple.leftFlank);
-                                
-                                // aligned the pre-reversed strings!
-                                AlignInfo a = landauVishkinObj.extend(
-                                        reftuple.leftFlank, 
-                                        qrytuple.leftFlank, 
-                                        K, ALLOW_DIFFERENCES);
-                                
-                                if (a.alignlen == -1) { return new AlignmentRecord(-1, -1, -1, -1, true); } // alignment failed
-                                if (!a.isBazeaYatesSeed(realleftflanklen, SEED_LEN)) { return new AlignmentRecord(-1, -1, -1, -1, true); }
-                                
-                                refStart    -= a.alignlen;
-                                differences = a.differences;
-                            }
-                            
-                            if (qrytuple.rightFlank.length != 0) {
-                                AlignInfo b = landauVishkinObj.extend(reftuple.rightFlank, 
-                                                                               qrytuple.rightFlank, 
-                                                                               K - differences, 
-                                                                               ALLOW_DIFFERENCES);
-                                if (b.alignlen == -1) { return new AlignmentRecord(-1, -1, -1, -1, true);   } // alignment failed
-                                refEnd      += b.alignlen;
-                                differences += b.differences;
-                            }
-                            
-                            AlignmentRecord fullalignment = new AlignmentRecord();
-                            fullalignment.m_refID       = reftuple.id;
-                            fullalignment.m_refStart    = refStart;
-                            fullalignment.m_refEnd      = refEnd;
-                            fullalignment.m_differences = differences;
-                            fullalignment.m_isRC        = qrytuple.isRC;
-                            return fullalignment;
-                        }
-                        catch (Exception e) {
-                            
-                            String err_msg = "###" + e.getStackTrace()[0];
-                            throw new IOException("Problem with read:" + qrytuple.id + " \n" + qrytuple.toString() +"\n" + e.toString() + " " + err_msg +"\n");   
-                            //System.out.println("Problem with read:" + qrytuple.id + ":" + e.toString());
-                            //return new AlignmentRecord(-1, -1, -1, -1, true);
-                        }
-                    }
-                }); 
+                    AlignmentRecord fullalignment = new AlignmentRecord();
+                    fullalignment.m_refID       = reftuple.id;
+                    fullalignment.m_refStart    = refStart;
+                    fullalignment.m_refEnd      = refEnd;
+                    fullalignment.m_differences = differences;
+                    fullalignment.m_isRC        = qrytuple.isRC;
+                    
+                    res.add(new Tuple2<IntWritable, BytesWritable>(new IntWritable(qrytuple.id), fullalignment.toBytes()));
+                }
+                catch (Exception e) {
+                    
+                    String err_msg = "###" + e.getStackTrace()[0];
+                    throw new IOException("Problem with read:" + qrytuple.id + " \n" + qrytuple.toString() +"\n" + e.toString() + " " + err_msg +"\n");   
+                    //System.out.println("Problem with read:" + qrytuple.id + ":" + e.toString());
+                    //return new AlignmentRecord(-1, -1, -1, -1, true);
+                }
+                return res;
+                
+            }
+        });
         
         alignments.saveAsNewAPIHadoopFile(
                 outputPath+"-alignments", 
@@ -508,18 +332,17 @@ public class SparkAligner {
                 BytesWritable.class, 
                 SequenceFileOutputFormat.class);
         
-        
         timeMid = System.currentTimeMillis();
         System.out.println("Alignment time: " + (timeMid-timeStart)/1000.0 + " seconds.");
         
         //********************************************RESULTS FILTERING************************************************************
+        
+        
         JavaPairRDD<IntWritable, BytesWritable> clonedAlignments 
             = context.sequenceFile(outputPath+"-alignments/part*", IntWritable.class, BytesWritable.class, refPartition + qryPartition).mapToPair(mapToClone);
         
         JavaPairRDD<IntWritable, Iterable<BytesWritable>> mappedAlignments = clonedAlignments.mapToPair(
-            /**
-             * Add a list to each record value
-             */
+         
             new PairFunction<Tuple2<IntWritable, BytesWritable>, IntWritable, Iterable<BytesWritable>>() {
                 @Override
                 public Tuple2<IntWritable, Iterable<BytesWritable>> call(
@@ -530,9 +353,7 @@ public class SparkAligner {
         
         JavaPairRDD<IntWritable, BytesWritable> unambiguousAlign 
             = mappedAlignments.reduceByKey(
-                /**
-                 * merge record values and leave the best two   
-                 */
+           
                 new Function2<Iterable<BytesWritable>, Iterable<BytesWritable>, Iterable<BytesWritable>>() {
                     @Override
                     public Iterable<BytesWritable> call(Iterable<BytesWritable> BytesListOne,
@@ -577,9 +398,7 @@ public class SparkAligner {
             })
             .flatMapToPair(
                 new PairFlatMapFunction<Tuple2<IntWritable,Iterable<BytesWritable>>, IntWritable, BytesWritable>() {
-                    /**
-                     * Output the best alignment when it is unique
-                     */
+               
                     @Override
                     public Iterable<Tuple2<IntWritable, BytesWritable>> call(
                             Tuple2<IntWritable, Iterable<BytesWritable>> recordWithList) throws Exception {
@@ -615,9 +434,7 @@ public class SparkAligner {
                     }
                 });
         
-        /**
-         * Save the results to sequence file
-         */
+        
         unambiguousAlign.saveAsNewAPIHadoopFile(
                 outputPath, 
                 IntWritable.class, 
@@ -627,6 +444,7 @@ public class SparkAligner {
         System.out.println("Filter time: " + (timeEnd - timeMid)/1000.0 + " seconds");
         System.out.println("Total time: " + (timeEnd - timeStart)/1000.0 + " seconds");
         System.out.println("Output alignments number: " + unambiguousAlign.count());
+        
         context.stop();
     }
 }
